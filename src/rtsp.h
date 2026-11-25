@@ -91,6 +91,7 @@ namespace rtsp_stream {
     uint32_t control_connect_data;  ///< Client-provided token used when connecting the control channel.
 
     bool host_audio;  ///< Whether host audio should be played locally.
+    bool enable_mic { false };  ///< Whether client microphone streaming is enabled.
     std::string unique_id;  ///< Moonlight client unique identifier for this launch request.
     int width;  ///< Frame or display width in pixels.
     int height;  ///< Frame or display height in pixels.

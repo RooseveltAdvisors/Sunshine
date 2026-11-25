@@ -928,6 +928,14 @@ namespace rtsp_stream {
       ss << "a=fmtp:97 surround-params="sv << session.surround_params << std::endl;
     }
 
+    if (config::audio.stream_mic) {
+      ss << "m=audio " << net::map_port(stream::MIC_STREAM_PORT) << " RTP/AVP 96" << std::endl;
+      ss << "a=rtpmap:96 opus/48000/2" << std::endl;
+      ss << "a=fmtp:96 minptime=20;useinbandfec=1" << std::endl;
+      ss << "a=ptime:20" << std::endl;
+      ss << "a=maxptime:20" << std::endl;
+    }
+
     for (int x = 0; x < audio::MAX_STREAM_CONFIG; ++x) {
       auto &stream_config = audio::stream_configs[x];
       std::array<std::uint8_t, platf::speaker::MAX_SPEAKERS> mapping;
@@ -991,6 +999,15 @@ namespace rtsp_stream {
       port = net::map_port(stream::VIDEO_STREAM_PORT);
     } else if (type == "control"sv) {
       port = net::map_port(stream::CONTROL_PORT);
+    } else if (type == "mic"sv) {
+      if (config::audio.stream_mic) {
+        session.enable_mic = true;
+        port = net::map_port(stream::MIC_STREAM_PORT);
+      } else {
+        session.enable_mic = false;
+        cmd_not_found(sock, session, std::move(req));
+        return;
+      }
     } else {
       cmd_not_found(sock, session, std::move(req));
 

@@ -364,6 +364,15 @@ namespace crypto {
        * @return The total length of the ciphertext written into cipher. Returns -1 in case of an error.
        */
       int encrypt(const std::string_view &plaintext, std::uint8_t *cipher, aes_t *iv);
+
+      /**
+       * @brief Decrypts ciphertext using AES CBC mode.
+       * @param cipher The ciphertext data to be decrypted.
+       * @param plaintext The vector where decrypted plaintext will be written.
+       * @param iv The initialization vector for decryption.
+       * @return 0 on success, -1 on error.
+       */
+      int decrypt(const std::string_view &cipher, std::vector<std::uint8_t> &plaintext, aes_t *iv);
     };
   }  // namespace cipher
 }  // namespace crypto

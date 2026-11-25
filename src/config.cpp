@@ -804,6 +804,7 @@ namespace config {
     {},  // audio_sink
     {},  // virtual_sink
     true,  // stream audio
+    true,  // stream_mic
     true,  // install_steam_drivers
     false,  // external_audio
   };
@@ -1813,6 +1814,7 @@ namespace config {
     string_f(vars, "audio_sink", audio.sink);
     string_f(vars, "virtual_sink", audio.virtual_sink);
     bool_f(vars, "stream_audio", audio.stream);
+    bool_f(vars, "stream_mic", audio.stream_mic);
     bool_f(vars, "install_steam_audio_drivers", audio.install_steam_drivers);
     bool_f(vars, "external_audio", audio.external_audio);
 

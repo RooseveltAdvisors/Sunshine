@@ -21,11 +21,13 @@
 #include "compat/moonlight.h"
 
 // local includes
+#include "audio.h"
 #include "config.h"
 #include "display_device.h"
 #include "globals.h"
 #include "input.h"
 #include "logging.h"
+#include "mic_mixer.h"
 #include "network.h"
 #include "platform/common.h"
 #include "process.h"
@@ -34,6 +36,9 @@
 #include "system_tray.h"
 #include "thread_safe.h"
 #include "utility.h"
+
+#include <unordered_map>
+#include <unordered_set>
 
 constexpr int IDX_START_A = 0;  ///< Control-stream message index for the first stream-start packet.
 constexpr int IDX_START_B = 1;  ///< Control-stream message index for the second stream-start packet.
@@ -318,6 +323,13 @@ namespace stream {
     AUDIO_FEC_HEADER fecHeader;  ///< Audio forward-error-correction header.
   };
 
+  constexpr std::uint8_t MIC_PACKET_TYPE_OPUS = 0x60;
+  constexpr std::uint8_t MIC_PACKET_TYPE_OPUS_ALT = 0x61;
+
+  struct mic_packet_t {
+    RTP_PACKET rtp;
+  };
+
 #pragma pack(pop)
 
   static_assert(sizeof(video_packet_raw_t) == sizeof(RTP_PACKET) + 4 + sizeof(NV_VIDEO_PACKET));
@@ -490,6 +502,33 @@ namespace stream {
 
     udp::socket video_sock {io_context};  ///< UDP socket bound for video packet transmission.
     udp::socket audio_sock {io_context};  ///< UDP socket bound for audio packet transmission.
+    udp::socket mic_sock {io_context};    ///< UDP socket bound for incoming client microphone packets.
+
+    std::jthread mic_thread;  ///< Thread that receives incoming client microphone packets.
+
+    struct mic_session_ctx_t {
+      std::uint32_t session_id;
+      std::uint32_t key_id;
+      boost::asio::ip::address client_address;
+      std::optional<udp::endpoint> source_endpoint;
+      std::optional<crypto::cipher::cbc_t> cipher;
+
+      mic_session_ctx_t(
+        std::uint32_t session_id,
+        std::uint32_t key_id,
+        boost::asio::ip::address client_address,
+        std::optional<crypto::cipher::cbc_t> cipher
+      ):
+          session_id {session_id},
+          key_id {key_id},
+          client_address {std::move(client_address)},
+          cipher {std::move(cipher)} {}
+    };
+
+    std::unordered_map<std::uint32_t, std::shared_ptr<mic_session_ctx_t>> mic_sessions;
+    std::mutex mic_session_mutex;
+    std::atomic<bool> mic_socket_enabled { false };
+    std::atomic<std::uint32_t> mic_session_count { 0 };
 
     control_server_t control_server;  ///< ENet server for GameStream control packets.
   };
@@ -568,7 +607,22 @@ namespace stream {
     safe::signal_t controlEnd;  ///< Signal raised when the control channel exits.
 
     std::atomic<session::state_e> state;  ///< Current lifecycle state observed by stream workers.
+
+    bool enable_mic { false };
+    bool mic_registered { false };
+
+    ~session_t();
   };
+
+  session_t::~session_t() {
+    if (mic_registered && broadcast_ref) {
+      std::lock_guard lock(broadcast_ref->mic_session_mutex);
+      broadcast_ref->mic_sessions.erase(launch_session_id);
+      if (broadcast_ref->mic_session_count.load() > 0) {
+        broadcast_ref->mic_session_count.fetch_sub(1);
+      }
+    }
+  }
 
   /**
    * First part of cipher must be struct of type control_encrypted_t
@@ -1443,6 +1497,169 @@ namespace stream {
     server->flush();
   }
 
+  void micBroadcastThread(broadcast_ctx_t &ctx) {
+    mic_mixer::mixer_t mixer;
+    std::unordered_set<std::uint32_t> mixer_sources;
+    bool mic_device_initialized = false;
+    audio::audio_ctx_ref_t mic_audio_ref;
+
+    auto broadcast_shutdown_event = mail::man->event<bool>(mail::broadcast_shutdown);
+
+    auto release_mic_device = [&]() {
+      if (mic_device_initialized) {
+        audio::release_mic_device();
+        BOOST_LOG(debug) << "Microphone redirect session released"sv;
+      }
+      mic_device_initialized = false;
+      mic_audio_ref = {};
+      mixer.clear();
+      mixer_sources.clear();
+    };
+
+    auto fg = util::fail_guard([&]() {
+      release_mic_device();
+    });
+
+    std::array<char, 2048> mic_recv_buffer;
+    udp::endpoint peer;
+
+    auto decode_candidate_payload = [](const std::shared_ptr<broadcast_ctx_t::mic_session_ctx_t> &mic_session,
+                                      const std::uint8_t *audio_data,
+                                      std::size_t data_size,
+                                      std::uint16_t sequence_number,
+                                      std::vector<std::uint8_t> &decoded_payload) -> bool {
+      decoded_payload.clear();
+      if (!mic_session->cipher) {
+        if (!mic_mixer::is_valid_opus_packet(audio_data, data_size)) {
+          return false;
+        }
+        decoded_payload.assign(audio_data, audio_data + data_size);
+        return true;
+      }
+
+      auto &cipher_ctx = *mic_session->cipher;
+      crypto::aes_t current_iv(16);
+      const auto iv_sequence = mic_session->key_id + sequence_number;
+      const auto iv_sequence_be = util::endian::big<std::uint32_t>(iv_sequence);
+      std::memcpy(current_iv.data(), &iv_sequence_be, sizeof(iv_sequence_be));
+      std::memset(current_iv.data() + sizeof(iv_sequence_be), 0, current_iv.size() - sizeof(iv_sequence_be));
+
+      const std::string_view ciphertext {
+        reinterpret_cast<const char *>(audio_data),
+        data_size,
+      };
+      return cipher_ctx.decrypt(ciphertext, decoded_payload, &current_iv) == 0 &&
+             mic_mixer::is_valid_opus_packet(decoded_payload.data(), decoded_payload.size());
+    };
+
+    auto process_audio_data = [&](const std::uint8_t *audio_data,
+                                std::size_t data_size,
+                                std::uint16_t sequence_number,
+                                std::optional<std::uint32_t> timestamp_ms,
+                                const udp::endpoint &source_endpoint) {
+      if (!ctx.mic_socket_enabled.load()) {
+        return;
+      }
+
+      std::vector<std::shared_ptr<broadcast_ctx_t::mic_session_ctx_t>> candidates;
+      {
+        std::lock_guard<std::mutex> lock(ctx.mic_session_mutex);
+        for (const auto &[session_id, session] : ctx.mic_sessions) {
+          (void) session_id;
+          if (session->client_address == source_endpoint.address()) {
+            candidates.emplace_back(session);
+          }
+        }
+        if (candidates.empty()) {
+          for (const auto &[session_id, session] : ctx.mic_sessions) {
+            candidates.emplace_back(session);
+          }
+        }
+      }
+
+      if (candidates.empty()) {
+        return;
+      }
+
+      std::vector<std::uint8_t> decoded_payload;
+      std::shared_ptr<broadcast_ctx_t::mic_session_ctx_t> mic_session;
+      for (const auto &candidate : candidates) {
+        if (decode_candidate_payload(candidate, audio_data, data_size, sequence_number, decoded_payload)) {
+          mic_session = candidate;
+          break;
+        }
+      }
+
+      if (!mic_session || !mic_device_initialized) {
+        return;
+      }
+
+      if (!mixer.add_source(mic_session->session_id)) {
+        return;
+      }
+      mixer_sources.insert(mic_session->session_id);
+      mixer.push_packet(
+        mic_session->session_id,
+        decoded_payload.data(),
+        decoded_payload.size(),
+        sequence_number,
+        timestamp_ms);
+    };
+
+    auto last_mix_time = std::chrono::steady_clock::now();
+
+    while (!broadcast_shutdown_event->peek() && ctx.mic_socket_enabled.load()) {
+      if (ctx.mic_session_count.load() == 0) {
+        if (mic_device_initialized) {
+          release_mic_device();
+        }
+        std::this_thread::sleep_for(50ms);
+        continue;
+      }
+
+      if (!mic_device_initialized) {
+        mic_audio_ref = audio::get_audio_ctx_ref();
+        if (audio::init_mic_device() == 0) {
+          mic_device_initialized = true;
+          BOOST_LOG(info) << "Microphone redirect device initialized"sv;
+        } else {
+          std::this_thread::sleep_for(100ms);
+          continue;
+        }
+      }
+
+      boost::system::error_code ec;
+      if (ctx.mic_sock.wait(ctx.mic_sock.wait_read, ec) == boost::system::errc::success) {
+        std::size_t received_bytes = ctx.mic_sock.receive_from(asio::buffer(mic_recv_buffer), peer, 0, ec);
+        if (!ec && received_bytes >= sizeof(RTP_PACKET)) {
+          auto *header = reinterpret_cast<mic_packet_t *>(mic_recv_buffer.data());
+          if (header->rtp.packetType == MIC_PACKET_TYPE_OPUS || header->rtp.packetType == MIC_PACKET_TYPE_OPUS_ALT) {
+            std::size_t header_size = sizeof(mic_packet_t);
+            if (received_bytes > header_size) {
+              uint16_t sequence_number = util::endian::little(header->rtp.sequenceNumber);
+              auto timestamp_ms = util::endian::little(header->rtp.timestamp);
+              std::size_t data_size = received_bytes - header_size;
+              process_audio_data(
+                reinterpret_cast<const std::uint8_t *>(mic_recv_buffer.data()) + header_size,
+                data_size,
+                sequence_number,
+                timestamp_ms,
+                peer);
+            }
+          }
+        }
+      }
+
+      auto now = std::chrono::steady_clock::now();
+      if (now - last_mix_time >= 20ms) {
+        last_mix_time = now;
+        if (auto mixed = mixer.mix_next_frame()) {
+          audio::write_mic_pcm(mixed->data(), mixed->size());
+        }
+      }
+    }
+  }
+
   /**
    * @brief Receive thread data.
    *
@@ -2099,6 +2316,20 @@ namespace stream {
 
     ctx.recv_thread = std::jthread {recvThread, std::ref(ctx)};
 
+    auto mic_port = net::map_port(MIC_STREAM_PORT);
+    ctx.mic_sock.open(protocol, ec);
+    if (!ec) {
+      ctx.mic_sock.bind(udp::endpoint(bind_addr, mic_port), ec);
+      if (!ec) {
+        ctx.mic_socket_enabled.store(true);
+        ctx.mic_thread = std::jthread {micBroadcastThread, std::ref(ctx)};
+        BOOST_LOG(info) << "Microphone server listening on port ["sv << mic_port << ']'sv;
+      } else {
+        BOOST_LOG(warning) << "Couldn't bind Microphone server to port ["sv << mic_port << "]: "sv << ec.message();
+        ctx.mic_sock.close(ec);
+      }
+    }
+
     return 0;
   }
 
@@ -2120,6 +2351,12 @@ namespace stream {
     ctx.message_queue_queue->stop();
     ctx.io_context.stop();
 
+    if (ctx.mic_socket_enabled.load()) {
+      ctx.mic_socket_enabled.store(false);
+      boost::system::error_code close_ec;
+      ctx.mic_sock.close(close_ec);
+    }
+
     ctx.video_sock.close();
     ctx.audio_sock.close();
 
@@ -2134,6 +2371,10 @@ namespace stream {
     ctx.audio_thread.join();
     BOOST_LOG(debug) << "Waiting for main control thread to end..."sv;
     ctx.control_thread.join();
+    if (ctx.mic_thread.joinable()) {
+      BOOST_LOG(debug) << "Waiting for microphone thread to end..."sv;
+      ctx.mic_thread.join();
+    }
     BOOST_LOG(debug) << "All broadcasting threads ended"sv;
 
     broadcast_shutdown_event->reset();
@@ -2452,6 +2693,22 @@ namespace stream {
       session->audio.avRiKeyId = util::endian::big(*(std::uint32_t *) launch_session.iv.data());
       session->audio.sequenceNumber = 0;
       session->audio.timestamp = 0;
+
+      session->enable_mic = launch_session.enable_mic;
+      session->broadcast_ref = broadcast.ref();
+      if (session->enable_mic && session->broadcast_ref) {
+        std::lock_guard lock(session->broadcast_ref->mic_session_mutex);
+        auto reg = std::make_shared<broadcast_ctx_t::mic_session_ctx_t>(
+          session->launch_session_id,
+          session->audio.avRiKeyId,
+          session->localAddress,
+          std::optional<crypto::cipher::cbc_t>(std::in_place, session->audio.cipher.key, session->audio.cipher.padding)
+        );
+        session->broadcast_ref->mic_sessions[session->launch_session_id] = reg;
+        session->broadcast_ref->mic_session_count.fetch_add(1);
+        session->mic_registered = true;
+        BOOST_LOG(info) << "Microphone session "sv << session->launch_session_id << " registered"sv;
+      }
 
       session->control.peer = nullptr;
       session->state.store(state_e::STOPPED, std::memory_order_relaxed);

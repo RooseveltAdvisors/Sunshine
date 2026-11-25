@@ -923,6 +923,31 @@ namespace platf {
     virtual std::optional<sink_t> sink_info() = 0;
 
     /**
+     * @brief Write client microphone PCM samples into the host's virtual microphone.
+     * @param samples Pointer to mono 16-bit 48kHz PCM samples.
+     * @param frame_count Number of samples in the frame.
+     * @return Number of bytes written, or negative on error.
+     */
+    virtual int write_mic_pcm(const std::int16_t *samples, std::size_t frame_count) {
+      (void) samples;
+      (void) frame_count;
+      return -1;
+    }
+
+    /**
+     * @brief Initialize the virtual microphone device on the host.
+     * @return 0 on success, negative on failure.
+     */
+    virtual int init_mic_redirect_device() {
+      return -1;
+    }
+
+    /**
+     * @brief Release the virtual microphone device on the host.
+     */
+    virtual void release_mic_redirect_device() {}
+
+    /**
      * @brief Destroy the audio control.
      */
     virtual ~audio_control_t() = default;

@@ -355,4 +355,29 @@ namespace audio {
     stream.coupledStreams = params.coupledStreams;
     stream.mapping = params.mapping.data();
   }
+
+  int init_mic_device() {
+    auto ref = get_audio_ctx_ref();
+    if (!ref || !ref->control) {
+      BOOST_LOG(debug) << "Audio context not active for microphone device init"sv;
+      return -1;
+    }
+    return ref->control->init_mic_redirect_device();
+  }
+
+  void release_mic_device() {
+    auto ref = get_audio_ctx_ref();
+    if (!ref || !ref->control) {
+      return;
+    }
+    ref->control->release_mic_redirect_device();
+  }
+
+  int write_mic_pcm(const std::int16_t *samples, std::size_t frame_count) {
+    auto ref = get_audio_ctx_ref();
+    if (!ref || !ref->control) {
+      return -1;
+    }
+    return ref->control->write_mic_pcm(samples, frame_count);
+  }
 }  // namespace audio

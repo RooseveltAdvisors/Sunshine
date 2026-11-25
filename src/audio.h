@@ -144,4 +144,23 @@ namespace audio {
    * @param ctx Native context object used by the operation or callback.
    */
   bool is_audio_ctx_sink_available(const audio_ctx_t &ctx);
+
+  /**
+   * @brief Write client microphone PCM samples into the host's virtual microphone.
+   * @param samples Pointer to mono 16-bit 48kHz PCM samples.
+   * @param frame_count Number of samples in the frame.
+   * @return Number of bytes written, or negative on error.
+   */
+  int write_mic_pcm(const std::int16_t *samples, std::size_t frame_count);
+
+  /**
+   * @brief Initialize the host virtual microphone device.
+   * @return 0 on success, negative on error.
+   */
+  int init_mic_device();
+
+  /**
+   * @brief Release the host virtual microphone device.
+   */
+  void release_mic_device();
 }  // namespace audio
