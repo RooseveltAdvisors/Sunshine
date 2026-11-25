@@ -2,8 +2,17 @@
  * @file src/cbs.cpp
  * @brief Definitions for FFmpeg Coded Bitstream API.
  */
+#ifndef AV_HAS_ATTRIBUTE
+#  ifdef __has_attribute
+#    define AV_HAS_ATTRIBUTE(x) __has_attribute(x)
+#  else
+#    define AV_HAS_ATTRIBUTE(x) 0
+#  endif
+#endif
+
 #include <array>
 extern "C" {
+#include <libavutil/attributes.h>
 // lib includes
 #include <libavcodec/avcodec.h>
 #include <libavcodec/cbs_h264.h>
