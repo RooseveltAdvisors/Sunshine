@@ -12,6 +12,8 @@ endif()
 
 set(MACOS_LINK_DIRECTORIES
         /opt/homebrew/lib
+        /opt/homebrew/opt/icu4c@78/lib
+        /opt/homebrew/opt/icu4c/lib
         /opt/local/lib
         /usr/local/lib)
 
