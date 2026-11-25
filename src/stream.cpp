@@ -2323,7 +2323,7 @@ namespace stream {
       if (!ec) {
         ctx.mic_socket_enabled.store(true);
         ctx.mic_thread = std::jthread {micBroadcastThread, std::ref(ctx)};
-        BOOST_LOG(info) << "Microphone server listening on port ["sv << mic_port << ']'sv;
+        BOOST_LOG(info) << "Microphone server listening on port ["sv << mic_port << "]"sv;
       } else {
         BOOST_LOG(warning) << "Couldn't bind Microphone server to port ["sv << mic_port << "]: "sv << ec.message();
         ctx.mic_sock.close(ec);
